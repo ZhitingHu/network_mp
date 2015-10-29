@@ -1,6 +1,10 @@
 
 PROJECT := mmsb
 
+# Petuum
+PETUUM_ROOT = /home/zhitingh/github-release/internal_bac
+include defns-networkmp.mk
+
 CONFIG_FILE := Makefile.config
 include $(CONFIG_FILE)
 
@@ -60,29 +64,21 @@ TOOL_BIN_LINKS := ${TOOL_BINS:.bin=}
 ##############################
 # Flags
 ##############################
-CXX = g++
-CXXFLAGS = -g \
-	   -O3 \
-           -std=c++11 \
-           -Wall \
-	   -Wno-sign-compare \
-           -fno-builtin-malloc \
-           -fno-builtin-calloc \
-           -fno-builtin-realloc \
-           -fno-builtin-free \
-           -fno-omit-frame-pointer
-
-INCFLAGS = -I${THIRD_PARTY_DIR}/include \
+CXX = ${PETUUM_CXX}
+CXXFLAGS = ${PETUUM_CXXFLAGS}
+INCFLAGS = ${PETUUM_INCFLAGS} \
            -I./include \
            -I./src \
            -I${BUILD_INCLUDE_DIR}
+           #-I${THIRD_PARTY_DIR}/include
 
-LDFLAGS = -L${THIRD_PARTY_DIR}/lib \
+LDFLAGS = $(PETUUM_LDFLAGS_DIRS) \
+          -L${THIRD_PARTY_DIR}/lib \
           -lprotobuf \
           -lgflags \
           -lglog \
-          -lgsl -lgslcblas
-          #-lpthread \
+          -lgsl -lgslcblas \
+          -lpthread \
 	  -lboost_system \
           -lboost_thread \
 
@@ -144,8 +140,8 @@ $(TOOL_BUILD_DIR)/%: $(TOOL_BUILD_DIR)/%.bin | $(TOOL_BUILD_DIR)
 	@ $(RM) $@
 	@ ln -s $(abspath $<) $@
 
-$(TOOL_BINS): %.bin : %.o $(DITREE_STATIC_NAME) 
-	$(CXX) $< $(DITREE_STATIC_NAME) $(CXXFLAGS) $(INCFLAGS) \
+$(TOOL_BINS): %.bin : %.o $(DITREE_STATIC_NAME) $(PETUUM_PS_LIB)
+	$(CXX) $< $(DITREE_STATIC_NAME) $(PETUUM_PS_LIB) $(CXXFLAGS) $(INCFLAGS) \
         $(LDFLAGS) -o $@
 	@ echo
 

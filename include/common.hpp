@@ -17,6 +17,7 @@
 
 #include <gflags/gflags.h>
 #include <glog/logging.h>
+#include <petuum_ps_common/include/petuum_ps.hpp>
 #include "proto/mmsb.pb.h"
 
 // gflags 2.1 issue: namespace google was changed to gflags without warning.
@@ -55,6 +56,46 @@ typedef unsigned int uint32; // Should work for all x86/x64 compilers
 typedef uint32 VIndex; // Vertex index
 typedef uint32 CIndex; // Community index
 typedef uint32 Count;  // count
+typedef uint32 WIndex; // Worker index 
+
+const int kNumPSTables = 2;
+enum TableIds {
+  kMsgTableID = 0,
+  kParamTableID
+};
+
+const uint32 kMsgTabMaxNumRows = 1e8; // max: 2^31 ~ 1e9
+enum MsgType {
+  kInactive = 0,
+  kProposal,
+  kFeedback,
+  kSetZ,
+  kTest
+};
+
+const int kNumMsgPrfxCols = 3;
+enum MsgTableCols {
+  kColIdxMsgType = 0,
+  kColIdxMsgVId,
+  kColIdxMsgNbrId
+  kColIdxMsgSt
+};
+
+enum MHStep {
+  kBetaPrpsl = 0,
+  kViPrpsl,
+  kVjPrpsl
+}
+
+const int kNumMHStepStates = 6;
+enum MHStepStates {
+  kB = 0, // beta-proposal
+  kI0,    // i-proposal, 0*
+  kI1,    // i-proposal, 1*
+  kJ00,   // j-proposal, 00*
+  kJ10,   // j-proposal, 10*
+  kJw1,   // j-proposal, [01]1*
+}
 
 } // namespace mmsb
 

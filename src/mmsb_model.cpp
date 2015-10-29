@@ -5,10 +5,14 @@
 
 namespace mmsb {
 
-MMSBModel::MMSBModel(const ModelParameter& param) {
+MMSBModel::MMSBModel(const ModelParameter& param,
+    const WIndex client_id, const WIndex thread_id) : 
+    client_id_(client_id), thread_id_(thread_id) {
   Init(param);
 }
-MMSBModel::MMSBModel(const string& param_file) {
+MMSBModel::MMSBModel(const string& param_file,
+    const WIndex client_id, const WIndex thread_id) :
+    client_id_(client_id), thread_id_(thread_id) {
   ModelParameter param;
   ReadProtoFromTextFile(param_file, &param);
   Init(param);
@@ -25,7 +29,8 @@ void MMSBModel::Init(const ModelParameter& param) {
   alpha_ = 1.0 / K_;
   beta_.resize(K_);
   lr_ = param_.solver_param().base_lr();
-  lambda_.resize(K_);
+  lambda_0_.resize(K_);
+  lambda_1_.resize(K_);
   lambda_grads_.resize(K_);
   bphi_sum_.resize(K_);
   bphi_square_sum_.resize(K_);
@@ -41,10 +46,42 @@ void MMSBModel::Init(const ModelParameter& param) {
   beta_proposal_times_ = 0;
   vertex_proposal_accept_times_ = 0;
   vertex_proposal_times_ = 0;
+
+  InitMsgPassing();
+}
+
+void MMSBModel::InitMsgPassing() {
+  //
+  msg_table_ = petuum::PSTableGroup::GetTableOrDie<float>(kMsgTableID);
+  param_table_ = petuum::PSTableGroup::GetTableOrDie<float>(kParamTableID);
+  //
+  uint32 num_clients = mmsb::Context::get_int32("num_clients");
+  uint32 num_threads = mmsb::Context::get_int32("num_app_threads");
+  num_workers_ = num_clients * num_threads; 
+  worker_id_ = client_id_ * num_threads + thread_id_;
+  omsg_st_rid_.resize(num_workers);
+  omsg_ed_rid_.resize(num_workers);
+  imsg_st_rid_.resize(num_workers);
+  imsg_ed_rid_.resize(num_workers);
+  uint32 num_imsg_rows_per_worker = kMsgTabMaxNumRows / num_workers;
+  uint32 num_omsg_rows_per_worker_pair = num_imsg_rows_per_worker / num_workers;
+  for (WIndex w = 0; w < num_workers; ++w) {
+    if (w == worker_id_) continue;
+    // outgoing msg
+    omsg_st_rid_[w] = num_imsg_rows_per_worker * w
+        + num_omsg_rows_per_worker_pair * worker_id_;
+    omsg_ed_rid_[w] = omsg_st_rid_[w] + num_omsg_rows_per_worker_pair;
+    omsg_cur_rid_[w] = omsg_st_rid_[w];
+    // incoming msg
+    imsg_st_rid_[w] = num_imsg_rows_per_worker * worker_id_
+        + num_omsg_rows_per_worker_pair * w;
+    imsg_ed_rid_[w] = imsg_st_rid_[w] + num_omsg_rows_per_worker_pair;
+    imsg_cur_rid_[w] = imsg_st_rid_[w];
+  } 
 }
 
 /// Input format: from_v_id \t to_v_id
-void MMSBModel::ReadData() {
+void MMSBModel::ReadData() { //TODO
   /// training data
   const string& train_data_path = Context::get_string("train_data");
   LOG(INFO) << "Read train data from " << train_data_path;
@@ -75,37 +112,103 @@ void MMSBModel::ReadData() {
   fstream test_data_file(test_data_path.c_str(), ios::in);
   CHECK(test_data_file.is_open()) << "Fail to open " << test_data_path; 
   int value = 0;
-  while (test_data_file >> i >> j >> value) {
-    if (value) {
-      test_pos_links_.push_back(make_pair(min(i, j), max(i, j)));
-    } else {
-      test_neg_links_.push_back(make_pair(min(i, j), max(i, j)));
+  WIndex i_worker, j_worker;
+  while (test_data_file >> i >> j >> value >> i_worker >> j_worker) {
+#ifdef DEBUG
+    CHECK(vertices_.find(i) != vertices_.end());
+    CHECK_EQ(i_worker, worker_id_);
+#endif
+    test_links_.push_back(make_pair(i, j));
+    test_link_values_.push_back(value);
+    if (j_worker != worker_id_) {
+      test_neighbor_worker_[j] = j_worker;
     }
   }
   LOG(INFO) << "#Test links (pos and neg links)\t"
-      << test_pos_links_.size() + test_neg_links_.size();
+      << test_links_.size();
   test_data_file.close();
 }
 
 void MMSBModel::InitModelState() {
   /// community assignment
-  for (VIndex i = 0; i < vertices_.size(); ++i) {
-    Vertex* v = vertices_[i];
+  for (auto& id_v : vertices_) {
+    const VIndex i = id_v.first;
+    Vertex* v = id_v.second;
     const unordered_map<VIndex, CIndex>& neighbor_z = v->neighbor_z();
-    for (const auto nz : neighbor_z) {
+    for (const auto& nz : neighbor_z) {
       VIndex j = nz.first;
       if (i >= j) continue;
 
       CIndex z = Context::randUInt64() % K_;
       v->SetZ(j, z);
-      vertices_[j]->SetZ(i, z);
+      auto vj = vertices_.find(j);
+      if (vj != vertices_.end()) { // vj is on the local worker
+        vj->second->SetZ(i, z);
+      } else { // vj is on another worker, send msg
+        SendZMsg(j, i, z);
+      }
     }
   }
 
+  petuum::PSTableGroup::GlobalBarrier();
+  SetZfromMsg();
+
   /// global param
-  fill(lambda_.begin(), lambda_.end(), eta_);  
+  fill(lambda_0_.begin(), lambda_0_.end(), eta_.first);  
+  fill(lambda_1_.begin(), lambda_1_.end(), eta_.second);  
 
   LOG(INFO) << "Init model state done.";
+}
+
+void MMSBModel::SendZMsg(VIndex nbr_i, Vindex i, CIndex z) {
+#ifdef DEBUG
+  CHECK(neighbor_worker_.find(nbr_i) != neighbor_worker_.end());
+#endif
+  // row id
+  WIndex nbr_w = neighbor_worker_[nbr_i];
+  uint32 row_id = GetOMsgRowId(nbr_w);
+  // msg content
+  petuum::DenseUpdateBatch<float> update_batch(
+      0, kNumMsgPrfxCols + 1);
+  update_batch[kColIdxMsgType] = kSetZ;
+  update_batch[kColIdxMsgVId] = nbr_i;
+  update_batch[kColIdxMsgNbrId] = i;
+  update_batch[kColIdxMsgSt] = z;
+  // send the msg 
+  msg_table_.DenseBatchInc(row_id, update_batch);
+}
+ 
+void MMSBModel::SetZfromMsg() {
+  /// recv all msgs to this worker
+  for (WIndex w = 0; w < num_workers_; ++w) {
+    if (w == worker_id_) continue;
+    uint32& rid = imsg_cur_rid_[w] = imsg_st_rid_[w];
+    while(true) {
+      vector<float> row_cache(kNumMsgPrfxCols + 1); //TODO: set size to the maximum size ?
+      petuum::RowAccessor row_acc;
+      const auto& r 
+          = msg_table_.Get<petuum::DenseRow<float> >(rid, &row_acc);
+      r.CopyToVector(&row_cache);
+      uint32 msg_type = row_cache[kColIdxMsgType];
+      if (msg_type == kSetZ) {
+        VIndex j = row_cache[kColIdxMsgVId];
+        VIndex nbr_j = row_cache[kColIdxMsgNbrId];
+        CIndex z = row_cache[kColIdxMsgSt];
+#ifdef DEBUG
+        CHECK(vertices_.find(j) != vertices_.end());
+        CHECK(neighbor_worker_.find(nbr_j) != neighbor_worker_.end());
+#endif
+        vertices_[j]->SetZ(nbr_j, z);
+        
+        ResetMsgRow(rid);    // reset the row 
+        AdvanceIMsgRowId(w); // next msg
+      } else if (msg_type == kInactive) { // empty msg, stop
+        break;
+      } else {
+        LOG(FATAL) << "Illegial msg type " << msg_type;
+      }
+    } // end of rows
+  }   // end of workers
 }
 
 /* -------------------- Train --------------------- */
@@ -115,7 +218,11 @@ void MMSBModel::SampleMinibatch(unordered_set<VIndex>& vertex_batch,
   vertex_batch.clear();
   for (int i = 0; i < batch_size; ++i) {
     while (true) {
-      VIndex v = Context::randUInt64() % vertices_.size();
+      // randomly sample a vertex from the map<.,.> vertices_
+      auto it = vertices_.begin();
+      uint32 nstep = Context::randUInt64() % vertices_.size();
+      std::advance(it, nstep);
+      VIndex v = it->first;
       if (vertex_batch.find(v) == vertex_batch.end()) { // to avoid duplicate
         vertex_batch.insert(v);
         break;
@@ -140,6 +247,9 @@ void MMSBModel::CollectLinks(set<pair<VIndex, VIndex> >& link_batch,
     const unordered_set<VIndex>& vertex_batch) {
   link_batch.clear();
   for (const auto i : vertex_batch) {
+#ifdef DEBUG
+    CHECK(vertices_.find(i) != vertices_.end());
+#endif
     const unordered_map<VIndex, CIndex>& neighbor_z
         = vertices_[i]->neighbor_z();
     for (const auto& nz : neighbor_z) {
@@ -147,9 +257,10 @@ void MMSBModel::CollectLinks(set<pair<VIndex, VIndex> >& link_batch,
           = make_pair(min(i, nz.first), max(i, nz.first));
       link_batch.insert(link);
     } // end of neighbors of i
-  } // end of vertexes
+  }   // end of vertexes
 }
 
+#if 0
 void MMSBModel::GibbsSample() {
   ComputeExpELogBeta();
   fill(train_batch_k_cnts_.begin(), train_batch_k_cnts_.end(), 0);
@@ -204,6 +315,7 @@ void MMSBModel::GibbsSample() {
     train_batch_k_cnts_[z_new]++;
   } // end of batch
 }
+#endif
 
 void MMSBModel::MHSample() {
   ComputeExpELogBeta();
@@ -214,23 +326,101 @@ void MMSBModel::MHSample() {
   for (const auto& link : train_batch_links_) {
     VIndex i = link.first;
     VIndex j = link.second;
-    CHECK_LT(i, vertices_.size());
-    CHECK_LT(j, vertices_.size());
-    Vertex* v_i = vertices_[i];
-    Vertex* v_j = vertices_[j];
-    CHECK_EQ(v_i->z_by_vertex_id(j), v_j->z_by_vertex_id(i));
+#ifdef DEBUG
+    // i must be on the local worker
+    CHECK(vertices_.find(i) != vertices_.end());
+    CHECK(vertices_.find(j) != vertices_.end() ||
+        neighbor_worker_.find(j) != neighbor_worker_.end());
+#endif
     CIndex z_prev = v_i->z_by_vertex_id(j);
-
-    CIndex z_new = MHSampleLink(v_i, v_j, z_prev);
-
-    if (z_new != z_prev) {
-      v_i->RemoveZ(z_prev);
-      v_j->RemoveZ(z_prev);
-      v_i->SetZ(j, z_new);
-      v_j->SetZ(i, z_new);
+    auto it_vj = vertices_.find(j);
+    if (it_vj != vertices_.end()) { // both vertices are on the local worker
+      CIndex z_new = MHSampleLink(v_i, v_j, z_prev);
+      if (z_new != z_prev) {
+        v_i->RemoveZ(z_prev);
+        v_j->RemoveZ(z_prev);
+        v_i->SetZ(j, z_new);
+        v_j->SetZ(i, z_new);
+      }
+      train_batch_k_cnts_[z_new]++;
+    } else {    // vertex j is on another worker
+      MHSampleLinkRemote(i, j, z_prev);
     }
-    train_batch_k_cnts_[z_new]++;
   }
+
+  petuum::PSTableGroup::GlobalBarrier();
+
+  /// process all proposal msgs
+  for (WIndex w = 0; w < num_workers_; ++w) {
+    if (w == worker_id_) continue;
+    uint32& rid = imsg_cur_rid_[w]
+    while(true) {
+      vector<float> row_cache(kNumMsgPrfxCols + 2); //TODO: set size to the maximum size ?
+      petuum::RowAccessor row_acc;
+      const auto& r 
+          = msg_table_.Get<petuum::DenseRow<float> >(rid, &row_acc);
+      r.CopyToVector(&row_cache);
+      uint32 msg_type = row_cache[kColIdxMsgType];
+      if (msg_type == kProposal) {
+        VIndex j = row_cache[kColIdxMsgVId];
+        VIndex nbr_j = row_cache[kColIdxMsgNbrId];
+        CIndex betap = row_cache[kColIdxMsgSt];
+        CIndex nbrp = row_cache[kColIdxMsgSt + 1];
+#ifdef DEBUG
+        CHECK(vertices_.find(j) != vertices_.end());
+        CHECK(neighbor_worker_.find(nbr_j) != neighbor_worker_.end());
+#endif
+        // feedback the msg
+        MHSampleLinkFeedback(j, nbr_j, z_prev, betap, nbrp);
+
+        ResetMsgRow(rid);    // reset the row 
+        AdvanceIMsgRowId(w); // next msg
+      } else if (msg_type == kInactive) { // empty msg, stop
+        break;
+      } else {
+        LOG(FATAL) << "Illegial msg type " << msg_type;
+      }
+    } // end of rows
+  }   // end of workers
+
+  petuum::PSTableGroup::GlobalBarrier();
+
+  /// Collect msgs and do accept-reject
+  for (WIndex w = 0; w < num_workers_; ++w) {
+    if (w == worker_id_) continue;
+    uint32& rid = imsg_cur_rid_[w]
+    while(true) {
+       //TODO: set size to the maximum size ?
+      vector<float> row_cache(kNumMsgPrfxCols + 1 + kNumMHStepStates);
+      petuum::RowAccessor row_acc;
+      const auto& r 
+          = msg_table_.Get<petuum::DenseRow<float> >(rid, &row_acc);
+      r.CopyToVector(&row_cache);
+      uint32 msg_type = row_cache[kColIdxMsgType];
+      if (msg_type == kFeedback) {
+        VIndex i = row_cache[kColIdxMsgVId];
+        VIndex j = row_cache[kColIdxMsgNbrId];
+        CIndex jp = row_cache[kColIdxMsgSt];
+#ifdef DEBUG
+        CHECK(vertices_.find(i) != vertices_.end());
+        CHECK(neighbor_worker_.find(j) != neighbor_worker_.end());
+#endif
+        // do accept-reject
+        MHSampleAcptRjct(i, j, jp, &row_cache[kColIdxMsgSt+1]);
+
+        ResetMsgRow(rid);    // reset the row 
+        AdvanceIMsgRowId(w); // next msg
+      } else if (msg_type == kInactive) { // empty msg, stop
+        break;
+      } else {
+        LOG(FATAL) << "Illegial msg type " << msg_type;
+      }
+    } // end of rows
+  }   // end of workers
+
+  petuum::PSTableGroup::GlobalBarrier();
+  /// update z from msg 
+  SetZfromMsg();
 
   // temp
   //LOG(INFO) << "beta propsal accept ratio\t" 
@@ -239,6 +429,250 @@ void MMSBModel::MHSample() {
   //LOG(INFO) << "vertex propsal accept ratio\t" 
   //    << (vertex_proposal_accept_times_ * 1.0 / vertex_proposal_times_) << "\t"
   //    << vertex_proposal_accept_times_ << "\t" << vertex_proposal_times_;
+}
+
+void MMSBModel::MHSampleLinkRemote(
+    const VIndex i, const VIndex j, const CIndex z_prev) {
+#ifdef DEBUG
+  CHECK(vertices_.find(i) != vertices_.end());
+  CHECK(neighbor_worker_.find(j) != neighbor_worker_.end());
+#endif
+  CIndex s;
+ 
+  /// beta proposal
+  s = z_prev;
+  CIndex betap = beta_alias_table_.Propose();
+
+  /// prefetch 1 i-proposal
+  Vertex* v_a = vertices_[i];
+  CIndex ip;
+  float nak_or_alpha = Context::rand() * (alpha_ * K_ + v_a->degree()); 
+  if (nak_or_alpha < v_a->degree()) { // propose by n_ak
+    uint32 nidx = Context::randUInt64() % v_a->degree();
+    ip = v_a->z_by_neighbor_idx(nidx);
+  } else { // propose by alpha (uniform)
+    ip = Context::randUInt64() % K_;
+  }
+  /// store the 2 proposals locally
+  pair<CIndex, CIndex>& betav_prpsls = v_a->nbr_betav_prpsls(j);
+  betav_prpsls.first = betap;
+  betav_prpsls.second = ip;
+  /// send the 2 proposals to vertex j
+  // row id
+  WIndex nbr_w = neighbor_worker_[j];
+  uint32 row_id = GetOMsgRowId(nbr_w);
+  // msg content
+  petuum::DenseUpdateBatch<float> update_batch(
+      0, kNumMsgPrfxCols + 2);
+  update_batch[kColIdxMsgType] = kProposal;
+  update_batch[kColIdxMsgVId] = j;
+  update_batch[kColIdxMsgNbrId] = i;
+  update_batch[kColIdxMsgSt] = betap;
+  update_batch[kColIdxMsgSt + 1] = ip;
+  // send the msg 
+  msg_table_.DenseBatchInc(row_id, update_batch);
+}
+
+void MMSBModel::MHSampleLinkFeedback(const VIndex j, const VIndex nbr_j,
+    const CIndex z_prev, const CIndex betap, const CIndex nbrp) {
+#ifdef DEBUG
+  CHECK(vertices_.find(j) != vertices_.end());
+  CHECK(neighbor_worker_.find(nbr_j) != neighbor_worker_.end());
+#endif
+  Vertex* v_a = vertices_[j];
+/*
+  /// prefetch 4 j-proposals
+  CIndex jp[4];
+  float jp_prob[4];
+  for (int p=0; p<4; ++p) {
+    float nak_or_alpha = Context::rand() * (alpha_ * K_ + v_a->degree()); 
+    if (nak_or_alpha < v_a->degree()) { // propose by n_ak
+      uint32 nidx = Context::randUInt64() % v_a->degree();
+      jp[p] = v_a->z_by_neighbor_idx(nidx);
+    } else { // propose by alpha (uniform)
+      jp[p] = Context::randUInt64() % K_;
+    }
+  }
+*/
+  /// prefetch *1* j-proposal
+  CIndex jp;
+  float nak_or_alpha = Context::rand() * (alpha_ * K_ + v_a->degree()); 
+  if (nak_or_alpha < v_a->degree()) { // propose by n_ak
+    uint32 nidx = Context::randUInt64() % v_a->degree();
+    jp = v_a->z_by_neighbor_idx(nidx);
+  } else { // propose by alpha (uniform)
+    jp = Context::randUInt64() % K_;
+  }
+
+  /// compute j-related terms of the reject-accept ratios
+  float jp_prob[kNumMHStepStates];
+  // *:  z_prev -> betap (ratio for beta-proposal) 
+  jp_prob[kB] = ComputeMHRatioTerm(v_a, z_prev, betap, z_prev, kBetaPrpsl);
+  // 0*:     z_prev -> nbrp (ratio for nrbj-proposal)
+  jp_prob[kI0] = ComputeMHRatioTerm(v_a, z_prev, nbrp, z_prev, kViPrpsl);
+  // 1*:     betap -> nbrp
+  jp_prob[kI1] = ComputeMHRatioTerm(v_a, betap, nbrp, z_prev, kViPrpsl);
+  // 00*:    z_prev -> jp (ratio for j-proposal)
+  jp_prob[kJ00] = ComputeMHRatioTerm(v_a, z_prev, jp, z_prev, kVjPrpsl);
+  // 10*:    betap -> jp
+  jp_prob[kJ10] = ComputeMHRatioTerm(v_a, betap, jp, z_prev, kVjPrpsl);
+  // [01]1*: nbrp -> jp
+  jp_prob[kJw1] = ComputeMHRatioTerm(v_a, nbrp, jp, z_prev, kVjPrpsl);
+
+
+  /// send the msg
+  // row id
+  WIndex nbr_w = neighbor_worker_[nbr_j];
+  uint32 row_id = GetOMsgRowId(nbr_w);
+  // msg content
+  petuum::DenseUpdateBatch<float> update_batch(
+      0, kNumMsgPrfxCols + 7);
+  update_batch[kColIdxMsgType] = kFeedback;
+  update_batch[kColIdxMsgVId] = nbr_j;
+  update_batch[kColIdxMsgNbrId] = j;
+  update_batch[kColIdxMsgSt] = jp;
+  for (int p=0; p<kNumMHStepStates; ++p) {
+    update_batch[kColIdxMsgSt + 1 + p] = jp_prob[p];
+  }
+  msg_table_.DenseBatchInc(row_id, update_batch);
+}
+
+float MMSBModel::ComputeMHRatioTerm(
+    Vertex* v, CIndex s, CIndex t, CIndex z_prev, int mh_step) {
+  float ns_alpha = v->z_cnt(s) + alpha_;
+  float nt_alpha = v->z_cnt(t) + alpha_;
+  //if (s != z_prev) {
+  //  ns_alpha += 1.0;
+  //  if (t == z_prev) {
+  //    nt_alpha -= 1.0;
+  //  }
+  //}
+  float ns_alpha_1 = ns_alpha; 
+  float nt_alpha_1 = nt_alpha;
+  if (s == z_prev) {
+    ns_alpha_1 -= 1.0;
+  }
+  if (t == z_prev) {
+    nt_alpha_1 -= 1.0;
+  }
+#ifdef DEBUG
+  CHECK_GT(ns_alpha_1, 0);
+  CHECK_GT(nt_alpha_1, 0);
+#endif
+  float ratio_term = 0;
+  if (mh_step == kBetaPrpsl || mh_step == kViPrpsl) { // beta/nbr_j proposal
+    ratio_term = nt_alpha_1 / ns_alpha_1;
+  } else if (mh_step == kVjPrpsl) {         // j proposal
+    ratio_term = nt_alpha_1 * ns_alpha / (ns_alpha_1 * nt_alpha);
+  } else {
+    LOG(FATAL) << "Illegal MHStep " << MHStep;
+  }
+  return ratio_term; 
+}
+
+void MHSampleAcptRjct(const VIndex i, const VIndex j,
+    const CIndex jp, const float* ratio_jterms) {
+#ifdef DEBUG
+  CHECK(vertices_.find(i) != vertices_.end());
+  CHECK(neighbor_worker_.find(j) != neighbor_worker_.end());
+#endif
+  Vertex* v_a = vertices_[i];
+  const pair<CIndex, CIndex>& betav_prpsls = v_a->nbr_betav_prpsls(j);
+  
+  const CIndex z_prev = v_a->z_by_vertex_id(j);
+  CIndex s = z_prev;
+  CIndex t = betav_prpsls.first;
+  /// accept-reject beta-proposal
+  float nas_alpha = v_a->z_cnt(s) + alpha_;
+  float nat_alpha = v_a->z_cnt(t) + alpha_;
+  float nas_alpha_1 = nas_alpha;
+  float nat_alpha_1 = nat_alpha;
+  if (s == z_prev) {
+    nas_alpha_1 -= 1.0;
+  }
+  if (t == z_prev) {
+    nat_alpha_1 -= 1.0;
+  }
+#ifdef DEBUG
+  CHECK_GT(nas_alpha_1, 0);
+  CHECK_GT(nat_alpha_1, 0);
+#endif
+
+  float accept_ratio = min((float)1.0, 
+      ratio_jterms[kB] * nat_alpha_1 / nas_alpha_1);
+  bool b_accept = (Context::rand() < accept_ratio);
+  s = b_baccept ? t : s;
+
+  beta_proposal_times_++;
+  beta_proposal_accept_times_ += (b_accept ? 0 : 1);
+
+  /// accept-reject i-proposal
+  t = betav_prpsls.second;
+  nas_alpha = v_a->z_cnt(s) + alpha_;
+  nat_alpha = v_a->z_cnt(t) + alpha_;
+  nas_alpha_1 = nas_alpha;
+  nat_alpha_1 = nat_alpha;
+  if (s == z_prev) {
+    nas_alpha_1 -= 1.0;
+  }
+  if (t == z_prev) {
+    nat_alpha_1 -= 1.0;
+  }
+#ifdef DEBUG
+  CHECK_GT(nas_alpha_1, 0);
+  CHECK_GT(nat_alpha_1, 0);
+#endif
+
+  float jterm = b_accept ? ratio_jterms[kI1] : ratio_jterms[kI0];
+  accept_ratio = min((float)1.0,
+      jterm * (nat_alpha * exp_Elog_beta_[t] * nas_alpha_1) 
+       / (nas_alpha * exp_Elog_beta_[s] * nat_alpha_1));
+  float i_accept = (Context::rand() < accept_ratio);
+  s = i_accept ? t : s;
+
+  vertex_proposal_times_++;
+  vertex_proposal_accept_times_ += (i_accept ? 0 : 1);
+
+  /// accept-reject j-proposal
+  t = jp;
+  nas_alpha = v_a->z_cnt(s) + alpha_;
+  nat_alpha = v_a->z_cnt(t) + alpha_;
+  nas_alpha_1 = nas_alpha;
+  nat_alpha_1 = nat_alpha;
+  if (s == z_prev) {
+    nas_alpha_1 -= 1.0;
+  }
+  if (t == z_prev) {
+    nat_alpha_1 -= 1.0;
+  }
+#ifdef DEBUG
+  CHECK_GT(nas_alpha_1, 0);
+  CHECK_GT(nat_alpha_1, 0);
+#endif
+
+  float jterm = 0;
+  if (i_accept) {
+    jterm = ratio_jterms[kJw1];
+  } else if (b_accept){
+    jterm = ratio_jterms[kJ10];
+  } else {
+    jterm = ratio_jterm[kJ00];
+  }
+  accept_ratio = min((float)1.0,
+      jterm * (exp_Elog_beta_[t] * nas_alpha_1) 
+       / (exp_Elog_beta_[s] * nat_alpha_1));
+  float j_accept = (Context::rand() < accept_ratio);
+  s = j_accept ? t : s;
+  
+  vertex_proposal_times_++;
+  vertex_proposal_accept_times_ += (j_accept ? 0 : 1);
+
+  /// set Z
+  if (s != z_prev) {
+    v_a->RemoveZ(z_prev);
+    v_a->SetZ(j, s);
+    SendZMsg(j, i, s);
+  }
 }
 
 CIndex MMSBModel::MHSampleLink(
@@ -391,35 +825,54 @@ void MMSBModel::VIComputeGrads() {
 }
 
 void MMSBModel::VIUpdate() {
+  /// push updates to PS
+  petuum::DenseUpdateBatch<float> update_batch_0(0, K_);
+  petuum::DenseUpdateBatch<float> update_batch_1(0, K_);
   float lr = lr_;
   for (int k = 0; k < K_; ++k) {
-    lambda_[k].first
-        = lambda_[k].first * (1.0 - lr) + lambda_grads_[k].first * lr;
-    lambda_[k].second
-        = lambda_[k].second * (1.0 - lr) + lambda_grads_[k].second * lr;
+    update_batch_0[k]
+        = lr * (lambda_grads_[k].first - lambda_0_[k]);
+    update_batch_1[k]
+        = lr * (lambda_grads_[k].second - lambda_1_[k]);
   }
+  // send the msg 
+  msg_table_.DenseBatchInc(0, update_batch_0);
+  msg_table_.DenseBatchInc(1, update_batch_1);
+
+  /// fetch the latest values
+  petuum::RowAccessor row_acc;
+  const auto& r0
+      = param_table_.Get<petuum::DenseRow<float> >(0, &row_acc);
+  r0.CopyToVector(&lambda_0_);
+  const auto& r1
+      = param_table_.Get<petuum::DenseRow<float> >(1, &row_acc);
+  r1.CopyToVector(&lambda_1_);
 }
 
 void MMSBModel::EstimateBeta() {
   ostringstream oss;
   for (int k = 0; k < K_; ++k) {
-    beta_[k] = lambda_[k].first / (lambda_[k].first + lambda_[k].second);
+    beta_[k] = lambda_0_[k] / (lambda_0_[k] + lambda_1_[k]);
     oss << beta_[k] << "\t";
   }
   //LOG(INFO) << oss.str();
 }
 
-void MMSBModel::ComputeExpELogBeta() {
+void MMSBModel::ComputeExpELogBeta() { 
   for (int k = 0; k < K_; ++k) {
     exp_Elog_beta_[k]
-        = std::exp(mmsb::digamma(lambda_[k].first)
-        - mmsb::digamma(lambda_[k].first + lambda_[k].second));
+        = std::exp(mmsb::digamma(lambda_0_[k])
+        - mmsb::digamma(lambda_0_[k].first + lambda_1_[k]));
   }
 }
 
 /// Assume beta_ is ready
 float MMSBModel::ComputeLinkLikelihood(
     const VIndex i, const VIndex j, const bool positive) {
+#ifdef DEBUG
+  CHECK(vertices_.find(i) != vertices_.end());
+  CHECK(vertices_.find(j) != vertices_.end());
+#endif
   float likelihood = 0;
   Vertex* v_i = vertices_[i];
   Vertex* v_j = vertices_[j];
@@ -445,6 +898,27 @@ float MMSBModel::ComputeLinkLikelihood(
   return log(likelihood);
 }
 
+float MMSBModel::ComputeLinkLikelihoodRemote(
+    const VIndex i, const VIndex j, const bool positive) {
+#ifdef DEBUG
+  CHECK(test_neighbor_worker_.find(j) != neighbor_worker__.end());
+#endif
+  Vertex* v_i = vertices_[i];
+  const auto& z_cnts = v_i->z_cnts();
+  WIndex nbr_w = test_neighbor_worker_[j];
+  const uint32 rid = GetOMsgRowId(nbr_w);
+  // msg content
+  petuum::DenseUpdateBatch<float> update_batch(
+      0, kNumMsgPrfxCols + z_cnts.size() * 2);
+  update_batch[kColIdxMsgType] = kSetZ;
+  update_batch[kColIdxMsgVId] = nbr_i;
+  update_batch[kColIdxMsgNbrId] = i;
+  update_batch[kColIdxMsgSt] = z;
+  // send the msg 
+  msg_table_.DenseBatchInc(row_id, update_batch);
+   
+}
+
 void MMSBModel::Test() {
   //LOG(INFO) << "Testing ... ";
   clock_t test_start_time = std::clock();
@@ -452,22 +926,29 @@ void MMSBModel::Test() {
   EstimateBeta();
 
   float lld = 0, lld_pos = 0, lld_neg = 0; // log likelihood
-  Count link_cnt = 0;
-  for (const auto& link : test_pos_links_) {
+  Count num_links = 0, num_pos_links = 0, num_neg_links = 0;
+  for (int t=0; t<test_links_.size(); ++t) {
+    const auto& link = test_links_[t];
     VIndex i = link.first;
     VIndex j = link.second;
-    float lld_ij = ComputeLinkLikelihood(i, j, true);
-    lld += lld_ij;
-    lld_pos += lld_ij;
-    link_cnt++;
-  }
-  for (const auto& link : test_neg_links_) {
-    VIndex i = link.first;
-    VIndex j = link.second;
-    float lld_ij = ComputeLinkLikelihood(i, j, false);
-    lld += lld_ij;
-    lld_neg += lld_ij;
-    link_cnt++;
+    const int value = test_link_values_[t];
+#ifdef DEBUG
+    CHECK(vertices_.find(i) != vertices_.end());
+    CHECK(vertices_.find(j) != vertices_.end() ||
+        test_neibor_worker_.find(j) != test_neibor_worker_.end());
+#endif
+    if (vertices_.find(j) != vertices_.end()) { 
+      float lld_ij = ComputeLinkLikelihood(i, j, value);
+      lld += lld_ij;
+      if (value) {
+        lld_pos += lld_ij;
+      } else {
+        lld_neg += lld_ij;
+      }
+      link_cnt++;
+    } else {
+
+    }
   }
 
   start_time_ += (std::clock() - test_start_time); // don't account for test time
@@ -482,33 +963,33 @@ void MMSBModel::Solve(const char* resume_file) {
   LOG(INFO) << "Solving MMSB";
 
   iter_ = 0;
-  if (resume_file) {
-    LOG(INFO) << "Restoring previous model status from " << resume_file;
-    Restore(resume_file);
-    LOG(INFO) << "Restoration done.";
-  } else {
+  //if (resume_file) {
+  //  LOG(INFO) << "Restoring previous model status from " << resume_file;
+  //  Restore(resume_file);
+  //  LOG(INFO) << "Restoration done.";
+  //} else {
     InitModelState();
-  }
+  //}
 
   const int start_iter = iter_;
 
   start_time_ = std::clock();
   for (; iter_ < param_.solver_param().max_iter(); ++iter_) {
     /// Save a snapshot if needed.
-    if (param_.solver_param().snapshot() && iter_ > start_iter &&
-        iter_ % param_.solver_param().snapshot() == 0) {
-      Snapshot();
-      SnapshotVis();
-    }
+    //if (param_.solver_param().snapshot() && iter_ > start_iter &&
+    //    iter_ % param_.solver_param().snapshot() == 0) {
+    //  Snapshot();
+    //  SnapshotVis();
+    //}
 
     /// Test if needed
-    if (param_.solver_param().test_interval() 
-        && iter_ % param_.solver_param().test_interval() == 0
-        && (iter_ > 0 || param_.solver_param().test_initialization())) {
-      //clock_t start_test = std::clock();
-      Test();
-      //LOG(INFO) << "test time " << (std::clock() - start_test) / (float)CLOCKS_PER_SEC;
-    }
+    //if (param_.solver_param().test_interval() 
+    //    && iter_ % param_.solver_param().test_interval() == 0
+    //    && (iter_ > 0 || param_.solver_param().test_initialization())) {
+    //  //clock_t start_test = std::clock();
+    //  Test();
+    //  //LOG(INFO) << "test time " << (std::clock() - start_test) / (float)CLOCKS_PER_SEC;
+    //}
 
     /// Sample mini-batch
     //clock_t start_data = std::clock();
@@ -548,8 +1029,8 @@ void MMSBModel::ToProto(ModelParameter* param) {
   param->clear_lambda_0();  
   param->clear_lambda_1();
   for (CIndex k = 0; k < K_; ++k) {
-    param->add_lambda_0(lambda_[k].first);
-    param->add_lambda_1(lambda_[k].second);
+    param->add_lambda_0(lambda_0_[k]);
+    param->add_lambda_1(lambda_1_[k]);
   }
   // vertex's params (neighbors, z)
   for (VIndex i = 0; i < vertices_.size(); ++i) {
@@ -586,7 +1067,7 @@ void MMSBModel::SnapshotVis() {
   fstream lambda_file(lambda_path.c_str(), ios::out);
   CHECK(lambda_file.is_open()) << "Fail to open " << lambda_path;
   for (int k = 0; k < K_; ++k) {
-    lambda_file << k << "\t" << lambda_[k].first << "\t" << lambda_[k].second 
+    lambda_file << k << "\t" << lambda_0_[k] << "\t" << lambda_1_[k]
         << "\t" << beta_[k] << "\n";
   }
   lambda_file.flush();
@@ -621,8 +1102,8 @@ void MMSBModel::Restore(const char* snapshot_file) {
   CHECK_EQ(vertices_.size(), param.vertices_size());
   // global param
   for (CIndex k = 0; k < K_; ++k) {
-    lambda_[k].first = param.lambda_0(k);
-    lambda_[k].second = param.lambda_1(k);
+    lambda_0_[k] = param.lambda_0(k);
+    lambda_1_[k] = param.lambda_1(k);
   }
   // vertex's params (neighbors, z)
   for (VIndex i = 0; i < vertices_.size(); ++i) {

@@ -19,8 +19,14 @@ class MMSBEngine {
   void Start();
  
  private:
+  void CreateTables();
 
  private:
+
+  ModelParameter param_;
+
+  // 
+  std::atomic<int> thread_counter_;
 
 };
 
